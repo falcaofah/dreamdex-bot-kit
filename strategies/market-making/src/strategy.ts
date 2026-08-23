@@ -52,7 +52,6 @@ export class MarketMaker {
         this.log(`startup cancelled id=${id}`);
       } catch (err) {
         this.log(`startup cancel failed id=${id}`, (err as Error).message);
-        // If it expired between the read and cancel, reclaim it explicitly.
         try {
           await this.pool.cancelExpired([id]);
           this.log(`startup reclaimed expired id=${id}`);
@@ -74,8 +73,39 @@ export class MarketMaker {
     }
   }
 
+  /**
+   * Reconcile our in-memory bid/ask against the contract. If a tracked order is
+   * no longer open it was either filled, cancelled or expired. We attempt an
+   * expired reclaim first (simulation prevents gas spend when it was a fill),
+   * then clear that leg so requote() can replenish it immediately.
+   */
+  private async reconcileTrackedLegs(): Promise<void> {
+    if (this.cfg.dryRun) return;
+    const tracked = [
+      ["bid", this.bid] as const,
+      ["ask", this.ask] as const,
+    ].filter(([, order]) => order && order.orderId !== 0n);
+    if (tracked.length === 0) return;
+
+    const openIds = await this.pool.openOrderIds();
+    const open = new Set(openIds.map((id) => id.toString()));
+
+    for (const [side, order] of tracked) {
+      if (!order || open.has(order.orderId.toString())) continue;
+
+      try {
+        await this.pool.cancelExpired([order.orderId]);
+        this.log(`replenish: reclaimed expired ${side} id=${order.orderId}`);
+      } catch {
+        this.log(`replenish: ${side} id=${order.orderId} filled/closed — replacing`);
+      }
+
+      if (side === "bid") this.bid = undefined;
+      else this.ask = undefined;
+    }
+  }
+
   private async requote(): Promise<void> {
-    // Gas guard is checked before any write path. Reads continue while paused.
     if (!this.cfg.dryRun) {
       const gasSomi = await this.pool.signerGasBalance();
       if (gasSomi < this.cfg.minGasSomi) {
@@ -86,6 +116,10 @@ export class MarketMaker {
       if (this.gasPaused) this.log(`RESUMED: gas balance ${gasSomi.toFixed(4)} SOMI`);
       this.gasPaused = false;
     }
+
+    // Detect fills/expiry before applying the price-movement threshold. A missing
+    // leg must be replenished even when mid barely moved.
+    await this.reconcileTrackedLegs();
 
     const { bestBid, bestAsk, mid } = await this.pool.topOfBook();
     if (mid === undefined) {
@@ -101,10 +135,16 @@ export class MarketMaker {
       }
     }
 
-    if (this.lastMid !== undefined && this.bid && this.ask) {
-      const driftBps = Math.abs((mid - this.lastMid) / this.lastMid) * 10_000;
-      if (driftBps < this.cfg.requoteTriggerBps) return;
-    }
+    const driftBps = this.lastMid === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.abs((mid - this.lastMid) / this.lastMid) * 10_000;
+    const priceMoveRequiresRequote = driftBps >= this.cfg.requoteTriggerBps;
+    const bidMissing = !this.bid;
+    const askMissing = !this.ask;
+
+    // Healthy two-sided quote + small price move = leave both orders resting.
+    if (!bidMissing && !askMissing && !priceMoveRequiresRequote) return;
+
     this.lastMid = mid;
     this.lastRequoteAt = Date.now();
 
@@ -123,8 +163,10 @@ export class MarketMaker {
 
     this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)}`);
 
-    await this.replaceLeg("bid", bidPrice, qty);
-    await this.replaceLeg("ask", askPrice, qty);
+    // When a leg disappeared but price barely moved, replenish only that side.
+    // On a real price move, refresh both sides so the pair stays competitive.
+    if (priceMoveRequiresRequote || bidMissing) await this.replaceLeg("bid", bidPrice, qty);
+    if (priceMoveRequiresRequote || askMissing) await this.replaceLeg("ask", askPrice, qty);
   }
 
   private async replaceLeg(side: "bid" | "ask", price: number, qty: number): Promise<void> {
@@ -138,7 +180,6 @@ export class MarketMaker {
       return;
     }
 
-    // Cancel/reclaim the previous leg BEFORE checking free wallet balance.
     if (existing && existing.orderId !== 0n) {
       let cleared = false;
       try {
@@ -165,8 +206,6 @@ export class MarketMaker {
       }
     }
 
-    // Re-read balances after cancellation/fills. Never broadcast an order the
-    // wallet cannot fund. Buffer absorbs rounding/fees and avoids noisy errors.
     const buffer = 1 + this.cfg.balanceBufferBps / 10_000;
     if (side === "bid") {
       const quote = await this.pool.walletQuote();
