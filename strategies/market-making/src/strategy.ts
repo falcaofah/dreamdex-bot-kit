@@ -152,8 +152,26 @@ export class MarketMaker {
     const imbalance = (invUsdso - this.cfg.targetInventoryUsdso) / this.cfg.notionalUsdso;
     const skewBps = imbalance * this.cfg.inventorySkewBps;
 
-    const bidPrice = shiftBps(mid, -this.cfg.halfSpreadBps - skewBps);
-    const askPrice = shiftBps(mid, +this.cfg.halfSpreadBps - skewBps);
+    const rawBidPrice = shiftBps(mid, -this.cfg.halfSpreadBps - skewBps);
+    const rawAskPrice = shiftBps(mid, +this.cfg.halfSpreadBps - skewBps);
+
+    // Inventory skew may try to push a quote through the opposite side of the
+    // book when inventory is very imbalanced. PostOnly orders must never cross.
+    // Clamp each side to the most aggressive maker-safe price (one tick away
+    // from the opposite best price). This preserves maker behavior while still
+    // allowing the skew to rebalance inventory as aggressively as possible.
+    let bidPrice = rawBidPrice;
+    let askPrice = rawAskPrice;
+    if (bestAsk !== undefined) bidPrice = Math.min(bidPrice, bestAsk - this.pool.tick);
+    if (bestBid !== undefined) askPrice = Math.max(askPrice, bestBid + this.pool.tick);
+
+    if (bidPrice !== rawBidPrice) {
+      this.log(`maker clamp bid ${rawBidPrice.toFixed(6)} -> ${bidPrice.toFixed(6)}`);
+    }
+    if (askPrice !== rawAskPrice) {
+      this.log(`maker clamp ask ${rawAskPrice.toFixed(6)} -> ${askPrice.toFixed(6)}`);
+    }
+
     const qty = this.cfg.notionalUsdso / mid;
 
     if (qty < this.pool.minQty) {
