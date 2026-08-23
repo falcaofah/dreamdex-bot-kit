@@ -6,13 +6,6 @@
  * found in the LICENSE file at https://github.com/somnia-chain/dreamdex-bot-kit/blob/main/LICENSE
  */
 
-// Runnable entry point: connect, quote, and keep quoting until Ctrl-C.
-//
-// Full flow in one file (auth is lazy — the REST client signs in on first use;
-// here we only need on-chain reads + writes, which the ChainContext covers):
-//   load market → subscribe to the book over WS → requote on updates (with an
-//   interval fallback) → cancel everything cleanly on shutdown.
-
 import { createChainContext, Pool, DreamDexWs } from "@dreamdex-bot-kit/core";
 import { config } from "./config.js";
 import { MarketMaker } from "./strategy.js";
@@ -31,8 +24,8 @@ async function main(): Promise<void> {
   log(`market ${config.symbol} tick=${pool.tick} lot=${pool.lot} minQty=${pool.minQty}`);
 
   const mm = new MarketMaker(pool, config, log);
+  await mm.initialize();
 
-  // WS-driven requoting, with a poll-interval fallback for quiet books.
   const ws = new DreamDexWs(
     ctx.net,
     (msg) => {
@@ -47,7 +40,6 @@ async function main(): Promise<void> {
     mm.onBook().catch((e) => log("tick error", (e as Error).message));
   }, config.refreshIntervalMs);
 
-  // Quote immediately, don't wait for the first WS message.
   await mm.onBook();
 
   const shutdown = async () => {
