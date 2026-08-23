@@ -70,12 +70,6 @@ export class MarketMaker {
     }
   }
 
-  /**
-   * Reconcile tracked legs against getOwnOpenOrders. If a recently-posted order
-   * disappears, treat it as filled/closed and replenish immediately WITHOUT an
-   * extra cancelExpiredOrders transaction. Only attempt an expired reclaim once
-   * the order has actually lived at least MM_EXPIRE_MS.
-   */
   private async reconcileTrackedLegs(): Promise<void> {
     if (this.cfg.dryRun) return;
     const tracked = [
@@ -148,18 +142,28 @@ export class MarketMaker {
     this.lastMid = mid;
     this.lastRequoteAt = Date.now();
 
-    const invUsdso = (await this.pool.walletBase()) * mid;
+    // walletBase() only sees free WBTC. A resting ask locks WBTC in the pool,
+    // so include that tracked quantity when computing total inventory. Without
+    // this, the strategy can think inventory is low and keep buying while a sell
+    // order is already holding part of the WBTC balance.
+    const freeBase = await this.pool.walletBase();
+    const lockedAskBase = this.ask?.qty ?? 0;
+    const totalBase = freeBase + lockedAskBase;
+    const invUsdso = totalBase * mid;
     const imbalance = (invUsdso - this.cfg.targetInventoryUsdso) / this.cfg.notionalUsdso;
     const skewBps = imbalance * this.cfg.inventorySkewBps;
+
+    // One-order inventory band around the target. Outside this band we stop
+    // adding inventory in the wrong direction and quote only the side that
+    // brings the wallet back toward target.
+    const lowerInventoryUsdso = Math.max(0, this.cfg.targetInventoryUsdso - this.cfg.notionalUsdso);
+    const upperInventoryUsdso = this.cfg.targetInventoryUsdso + this.cfg.notionalUsdso;
+    const inventoryTooLong = invUsdso > upperInventoryUsdso;
+    const inventoryTooShort = invUsdso < lowerInventoryUsdso;
 
     const rawBidPrice = shiftBps(mid, -this.cfg.halfSpreadBps - skewBps);
     const rawAskPrice = shiftBps(mid, +this.cfg.halfSpreadBps - skewBps);
 
-    // Inventory skew may try to push a quote through the opposite side of the
-    // book when inventory is very imbalanced. PostOnly orders must never cross.
-    // Clamp each side to the most aggressive maker-safe price (one tick away
-    // from the opposite best price). This preserves maker behavior while still
-    // allowing the skew to rebalance inventory as aggressively as possible.
     let bidPrice = rawBidPrice;
     let askPrice = rawAskPrice;
     if (bestAsk !== undefined) bidPrice = Math.min(bidPrice, bestAsk - this.pool.tick);
@@ -179,17 +183,34 @@ export class MarketMaker {
       return;
     }
 
-    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)}`);
+    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)} invUsdso=${invUsdso.toFixed(2)}`);
 
-    if (priceMoveRequiresRequote || bidMissing) await this.replaceLeg("bid", bidPrice, qty);
-    if (priceMoveRequiresRequote || askMissing) await this.replaceLeg("ask", askPrice, qty);
+    if (inventoryTooLong) {
+      if (this.bid) await this.replaceLeg("bid", bidPrice, qty, false);
+      else this.log(`INVENTORY GUARD: ${invUsdso.toFixed(2)} USDso > ${upperInventoryUsdso.toFixed(2)} — bid paused`);
+    } else if (priceMoveRequiresRequote || bidMissing) {
+      await this.replaceLeg("bid", bidPrice, qty);
+    }
+
+    if (inventoryTooShort) {
+      if (this.ask) await this.replaceLeg("ask", askPrice, qty, false);
+      else this.log(`INVENTORY GUARD: ${invUsdso.toFixed(2)} USDso < ${lowerInventoryUsdso.toFixed(2)} — ask paused`);
+    } else if (priceMoveRequiresRequote || askMissing) {
+      await this.replaceLeg("ask", askPrice, qty);
+    }
   }
 
-  private async replaceLeg(side: "bid" | "ask", price: number, qty: number): Promise<void> {
+  private async replaceLeg(side: "bid" | "ask", price: number, qty: number, placeAfterCancel = true): Promise<void> {
     const existing = side === "bid" ? this.bid : this.ask;
-    if (existing && approxEq(existing.price, price) && approxEq(existing.qty, qty)) return;
+    if (placeAfterCancel && existing && approxEq(existing.price, price) && approxEq(existing.qty, qty)) return;
 
     if (this.cfg.dryRun) {
+      if (!placeAfterCancel) {
+        this.log(`[dry-run] inventory guard would cancel ${side}`);
+        if (side === "bid") this.bid = undefined;
+        else this.ask = undefined;
+        return;
+      }
       const rec = { orderId: 0n, price, qty, postedAtMs: Date.now() };
       this.log(`[dry-run] ${side} ${qty.toFixed(6)} @ ${price.toFixed(6)}`);
       if (side === "bid") this.bid = rec;
@@ -228,6 +249,11 @@ export class MarketMaker {
         if (side === "bid") this.bid = undefined;
         else this.ask = undefined;
       }
+    }
+
+    if (!placeAfterCancel) {
+      this.log(`INVENTORY GUARD: cancelled ${side}; waiting for inventory to rebalance`);
+      return;
     }
 
     const buffer = 1 + this.cfg.balanceBufferBps / 10_000;
