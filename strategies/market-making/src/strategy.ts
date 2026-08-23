@@ -13,6 +13,7 @@ interface RestingOrder {
   orderId: bigint;
   price: number;
   qty: number;
+  postedAtMs: number;
 }
 
 export class MarketMaker {
@@ -29,10 +30,6 @@ export class MarketMaker {
     private readonly log: (msg: string, extra?: unknown) => void,
   ) {}
 
-  /**
-   * On every real startup, remove any open orders left by a previous process.
-   * This prevents a Railway restart from stacking new quotes on top of ghosts.
-   */
   async initialize(): Promise<void> {
     const ids = await this.pool.openOrderIds();
     if (ids.length === 0) {
@@ -74,10 +71,10 @@ export class MarketMaker {
   }
 
   /**
-   * Reconcile our in-memory bid/ask against the contract. If a tracked order is
-   * no longer open it was either filled, cancelled or expired. We attempt an
-   * expired reclaim first (simulation prevents gas spend when it was a fill),
-   * then clear that leg so requote() can replenish it immediately.
+   * Reconcile tracked legs against getOwnOpenOrders. If a recently-posted order
+   * disappears, treat it as filled/closed and replenish immediately WITHOUT an
+   * extra cancelExpiredOrders transaction. Only attempt an expired reclaim once
+   * the order has actually lived at least MM_EXPIRE_MS.
    */
   private async reconcileTrackedLegs(): Promise<void> {
     if (this.cfg.dryRun) return;
@@ -89,15 +86,21 @@ export class MarketMaker {
 
     const openIds = await this.pool.openOrderIds();
     const open = new Set(openIds.map((id) => id.toString()));
+    const now = Date.now();
 
     for (const [side, order] of tracked) {
       if (!order || open.has(order.orderId.toString())) continue;
 
-      try {
-        await this.pool.cancelExpired([order.orderId]);
-        this.log(`replenish: reclaimed expired ${side} id=${order.orderId}`);
-      } catch {
-        this.log(`replenish: ${side} id=${order.orderId} filled/closed — replacing`);
+      const ageMs = Math.max(0, now - order.postedAtMs);
+      if (ageMs >= this.cfg.expireMs) {
+        try {
+          await this.pool.cancelExpired([order.orderId]);
+          this.log(`replenish: reclaimed expired ${side} id=${order.orderId}`);
+        } catch {
+          this.log(`replenish: ${side} id=${order.orderId} already closed — replacing`);
+        }
+      } else {
+        this.log(`replenish: ${side} id=${order.orderId} filled/closed after ${(ageMs / 1000).toFixed(1)}s — replacing`);
       }
 
       if (side === "bid") this.bid = undefined;
@@ -117,8 +120,6 @@ export class MarketMaker {
       this.gasPaused = false;
     }
 
-    // Detect fills/expiry before applying the price-movement threshold. A missing
-    // leg must be replenished even when mid barely moved.
     await this.reconcileTrackedLegs();
 
     const { bestBid, bestAsk, mid } = await this.pool.topOfBook();
@@ -142,7 +143,6 @@ export class MarketMaker {
     const bidMissing = !this.bid;
     const askMissing = !this.ask;
 
-    // Healthy two-sided quote + small price move = leave both orders resting.
     if (!bidMissing && !askMissing && !priceMoveRequiresRequote) return;
 
     this.lastMid = mid;
@@ -163,8 +163,6 @@ export class MarketMaker {
 
     this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)}`);
 
-    // When a leg disappeared but price barely moved, replenish only that side.
-    // On a real price move, refresh both sides so the pair stays competitive.
     if (priceMoveRequiresRequote || bidMissing) await this.replaceLeg("bid", bidPrice, qty);
     if (priceMoveRequiresRequote || askMissing) await this.replaceLeg("ask", askPrice, qty);
   }
@@ -174,9 +172,10 @@ export class MarketMaker {
     if (existing && approxEq(existing.price, price) && approxEq(existing.qty, qty)) return;
 
     if (this.cfg.dryRun) {
+      const rec = { orderId: 0n, price, qty, postedAtMs: Date.now() };
       this.log(`[dry-run] ${side} ${qty.toFixed(6)} @ ${price.toFixed(6)}`);
-      if (side === "bid") this.bid = { orderId: 0n, price, qty };
-      else this.ask = { orderId: 0n, price, qty };
+      if (side === "bid") this.bid = rec;
+      else this.ask = rec;
       return;
     }
 
@@ -187,17 +186,24 @@ export class MarketMaker {
         cleared = true;
       } catch (err) {
         this.log(`cancel ${side} failed id=${existing.orderId}`, (err as Error).message);
-        try {
-          await this.pool.cancelExpired([existing.orderId]);
-          cleared = true;
-          this.log(`reclaimed expired ${side} id=${existing.orderId}`);
-        } catch {
-          const openIds = await this.pool.openOrderIds();
-          cleared = !openIds.some((id) => id === existing.orderId);
-          if (!cleared) {
-            this.log(`SKIP ${side}: previous order id=${existing.orderId} is still open`);
-            return;
+        const openIds = await this.pool.openOrderIds();
+        const stillOpen = openIds.some((id) => id === existing.orderId);
+        if (!stillOpen) {
+          const ageMs = Math.max(0, Date.now() - existing.postedAtMs);
+          if (ageMs >= this.cfg.expireMs) {
+            try {
+              await this.pool.cancelExpired([existing.orderId]);
+              this.log(`reclaimed expired ${side} id=${existing.orderId}`);
+            } catch {
+              this.log(`${side} id=${existing.orderId} already closed — replacing`);
+            }
+          } else {
+            this.log(`${side} id=${existing.orderId} filled/closed — replacing without reclaim tx`);
           }
+          cleared = true;
+        } else {
+          this.log(`SKIP ${side}: previous order id=${existing.orderId} is still open`);
+          return;
         }
       }
       if (cleared) {
@@ -231,7 +237,7 @@ export class MarketMaker {
         orderType: ORDER_TYPE.PostOnly,
         expireMs: this.cfg.expireMs,
       });
-      const rec = { orderId: res.orderId ?? 0n, price, qty };
+      const rec = { orderId: res.orderId ?? 0n, price, qty, postedAtMs: Date.now() };
       if (side === "bid") this.bid = rec;
       else this.ask = rec;
       this.log(`posted ${side} ${qty.toFixed(6)} @ ${price.toFixed(6)} id=${res.orderId} tx=${res.txHash}`);
@@ -248,7 +254,10 @@ export class MarketMaker {
         try {
           await this.pool.cancel(o.orderId);
         } catch {
-          try { await this.pool.cancelExpired([o.orderId]); } catch { /* best-effort */ }
+          const ageMs = Math.max(0, Date.now() - o.postedAtMs);
+          if (ageMs >= this.cfg.expireMs) {
+            try { await this.pool.cancelExpired([o.orderId]); } catch { /* best-effort */ }
+          }
         }
       }
     }
