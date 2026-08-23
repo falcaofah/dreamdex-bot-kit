@@ -28,9 +28,7 @@ function bool(key: string, fallback: boolean): boolean {
 }
 
 export const config = {
-  /** Which market to quote. SOMI:USDso exists on both mainnet and testnet, so it
-   *  works out of the box. On mainnet, the stable/stable USDC.e:USDso is a lower
-   *  inventory-risk choice — set MM_SYMBOL to it there. */
+  /** Which market to quote. */
   symbol: str("MM_SYMBOL", "SOMI:USDso"),
   /** Half-spread each side of mid, in bps. Total quoted spread = 2× this. */
   halfSpreadBps: num("MM_HALF_SPREAD_BPS", 5),
@@ -40,16 +38,20 @@ export const config = {
   targetInventoryUsdso: num("MM_TARGET_INVENTORY_USDSO", 0),
   /** How hard to skew per unit of inventory imbalance, in bps per 1× notional. */
   inventorySkewBps: num("MM_INVENTORY_SKEW_BPS", 4),
-  /** Only requote once mid has moved this many bps (saves gas leaving good quotes). */
+  /** Only requote once mid has moved this many bps. */
   requoteTriggerBps: num("MM_REQUOTE_TRIGGER_BPS", 3),
-  /** Don't quote if the book's own spread is wider than this (thin/dislocated book). */
+  /** Don't quote if the book's own spread is wider than this. */
   maxBookSpreadBps: num("MM_MAX_BOOK_SPREAD_BPS", 50),
   /** Minimum wall-time between requotes, ms. */
   requoteCooldownMs: num("MM_REQUOTE_COOLDOWN_MS", 2_000),
   /** Fallback poll interval if the WS feed is quiet, ms. */
   refreshIntervalMs: num("MM_REFRESH_INTERVAL_MS", 5_000),
-  /** Resting order lifetime, ms (rebuilt on each requote anyway). */
+  /** Resting order lifetime, ms. */
   expireMs: num("MM_EXPIRE_MS", 60 * 60_000),
+  /** Extra balance headroom required before placing either leg. */
+  balanceBufferBps: num("MM_BALANCE_BUFFER_BPS", 20),
+  /** Stop sending transactions when signer gas balance falls below this amount of SOMI. */
+  minGasSomi: num("MM_MIN_GAS_SOMI", 1),
   /** Log intended actions without sending any transaction. */
   dryRun: bool("DRY_RUN", true),
 };
