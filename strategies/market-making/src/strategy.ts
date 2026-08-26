@@ -153,11 +153,11 @@ export class MarketMaker {
     const imbalance = (invUsdso - this.cfg.targetInventoryUsdso) / this.cfg.notionalUsdso;
     const skewBps = imbalance * this.cfg.inventorySkewBps;
 
-    // One-order inventory band around the target. Outside this band we stop
+    // Configurable inventory band around the target. Outside this band we stop
     // adding inventory in the wrong direction and quote only the side that
-    // brings the wallet back toward target.
-    const lowerInventoryUsdso = Math.max(0, this.cfg.targetInventoryUsdso - this.cfg.notionalUsdso);
-    const upperInventoryUsdso = this.cfg.targetInventoryUsdso + this.cfg.notionalUsdso;
+    // brings the wallet back toward target. The default remains one notional.
+    const lowerInventoryUsdso = Math.max(0, this.cfg.targetInventoryUsdso - this.cfg.inventoryGuardBandUsdso);
+    const upperInventoryUsdso = this.cfg.targetInventoryUsdso + this.cfg.inventoryGuardBandUsdso;
     const inventoryTooLong = invUsdso > upperInventoryUsdso;
     const inventoryTooShort = invUsdso < lowerInventoryUsdso;
 
