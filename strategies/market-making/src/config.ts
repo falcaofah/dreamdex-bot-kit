@@ -36,6 +36,11 @@ export const config = {
   notionalUsdso: num("MM_NOTIONAL_USDSO", 20),
   /** Target base inventory in quote terms; quotes skew to pull inventory back here. */
   targetInventoryUsdso: num("MM_TARGET_INVENTORY_USDSO", 0),
+  /** Half-width of the inventory guard band, in USDso. Defaults to one order notional. */
+  inventoryGuardBandUsdso: num(
+    "MM_INVENTORY_GUARD_BAND_USDSO",
+    num("MM_NOTIONAL_USDSO", 20),
+  ),
   /** How hard to skew per unit of inventory imbalance, in bps per 1× notional. */
   inventorySkewBps: num("MM_INVENTORY_SKEW_BPS", 4),
   /** Only requote once mid has moved this many bps. */
