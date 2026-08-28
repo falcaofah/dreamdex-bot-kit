@@ -132,7 +132,7 @@ export class MarketMaker {
 
     this.trendHistory.push({ ts: now, mid });
     const cutoff = now - this.cfg.trendMoveWindowMs;
-    while (this.trendHistory.length > 2 && this.trendHistory[1].ts < cutoff) {
+    while (this.trendHistory.length > 2 && this.trendHistory[1]!.ts < cutoff) {
       this.trendHistory.shift();
     }
 
