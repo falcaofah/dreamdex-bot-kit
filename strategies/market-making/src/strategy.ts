@@ -132,7 +132,7 @@ export class MarketMaker {
 
     this.trendHistory.push({ ts: now, mid });
     const cutoff = now - this.cfg.trendMoveWindowMs;
-    while (this.trendHistory.length > 2 && this.trendHistory[1].ts < cutoff) {
+    while (this.trendHistory.length > 2 && this.trendHistory[1]!.ts < cutoff) {
       this.trendHistory.shift();
     }
 
@@ -221,13 +221,26 @@ export class MarketMaker {
     const imbalance = (invUsdso - effectiveTargetInventoryUsdso) / this.cfg.notionalUsdso;
     const skewBps = imbalance * this.cfg.inventorySkewBps;
 
-    // Configurable inventory band around the effective target. Outside this band we stop
-    // adding inventory in the wrong direction and quote only the side that
-    // brings the wallet back toward target.
+    // Hard guard: outside this band, stop quoting the side that would worsen inventory.
     const lowerInventoryUsdso = Math.max(0, effectiveTargetInventoryUsdso - this.cfg.inventoryGuardBandUsdso);
     const upperInventoryUsdso = effectiveTargetInventoryUsdso + this.cfg.inventoryGuardBandUsdso;
     const inventoryTooLong = invUsdso > upperInventoryUsdso;
     const inventoryTooShort = invUsdso < lowerInventoryUsdso;
+
+    // Soft guard: before reaching the hard limit, keep both sides live but reduce
+    // only the side that would push inventory farther away from target.
+    const softWidthUsdso = Math.min(
+      Math.max(0, this.cfg.softInventoryGuardWidthUsdso),
+      Math.max(0, this.cfg.inventoryGuardBandUsdso),
+    );
+    const lowerSoftInventoryUsdso = lowerInventoryUsdso + softWidthUsdso;
+    const upperSoftInventoryUsdso = upperInventoryUsdso - softWidthUsdso;
+    const inventorySoftShort = this.cfg.softInventoryGuardEnabled
+      && !inventoryTooShort
+      && invUsdso < lowerSoftInventoryUsdso;
+    const inventorySoftLong = this.cfg.softInventoryGuardEnabled
+      && !inventoryTooLong
+      && invUsdso > upperSoftInventoryUsdso;
 
     const rawBidPrice = shiftBps(mid, -this.cfg.halfSpreadBps - skewBps);
     const rawAskPrice = shiftBps(mid, +this.cfg.halfSpreadBps - skewBps);
@@ -244,27 +257,42 @@ export class MarketMaker {
       this.log(`maker clamp ask ${rawAskPrice.toFixed(6)} -> ${askPrice.toFixed(6)}`);
     }
 
-    const qty = this.cfg.notionalUsdso / mid;
-
-    if (qty < this.pool.minQty) {
-      this.log(`qty ${qty} below market min ${this.pool.minQty} — raise MM_NOTIONAL_USDSO`);
+    const normalQty = this.cfg.notionalUsdso / mid;
+    if (normalQty < this.pool.minQty) {
+      this.log(`qty ${normalQty} below market min ${this.pool.minQty} — raise MM_NOTIONAL_USDSO`);
       return;
     }
 
-    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)} invUsdso=${invUsdso.toFixed(2)} trend=${this.trendState} target=${effectiveTargetInventoryUsdso.toFixed(2)}`);
+    const reducedNotionalUsdso = Math.min(
+      this.cfg.notionalUsdso,
+      Math.max(0, this.cfg.softInventoryGuardNotionalUsdso),
+    );
+    const requestedReducedQty = reducedNotionalUsdso / mid;
+    const reducedQty = requestedReducedQty >= this.pool.minQty ? requestedReducedQty : normalQty;
+    if (this.cfg.softInventoryGuardEnabled && reducedQty === normalQty && reducedNotionalUsdso < this.cfg.notionalUsdso) {
+      this.log(`SOFT INVENTORY GUARD: reduced qty ${requestedReducedQty.toFixed(6)} below market min ${this.pool.minQty}; using normal qty`);
+    }
+
+    const bidQty = inventorySoftLong ? reducedQty : normalQty;
+    const askQty = inventorySoftShort ? reducedQty : normalQty;
+    const bidSizeChanged = !!this.bid && !approxEq(this.bid.qty, bidQty);
+    const askSizeChanged = !!this.ask && !approxEq(this.ask.qty, askQty);
+    const softState = inventorySoftShort ? "LOW" : inventorySoftLong ? "HIGH" : "OFF";
+
+    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} bidQty=${bidQty.toFixed(6)} askQty=${askQty.toFixed(6)} skewBps=${skewBps.toFixed(2)} invUsdso=${invUsdso.toFixed(2)} trend=${this.trendState} target=${effectiveTargetInventoryUsdso.toFixed(2)} soft=${softState}`);
 
     if (inventoryTooLong) {
-      if (this.bid) await this.replaceLeg("bid", bidPrice, qty, false);
+      if (this.bid) await this.replaceLeg("bid", bidPrice, bidQty, false);
       else this.log(`INVENTORY GUARD: ${invUsdso.toFixed(2)} USDso > ${upperInventoryUsdso.toFixed(2)} — bid paused`);
-    } else if (priceMoveRequiresRequote || bidMissing) {
-      await this.replaceLeg("bid", bidPrice, qty);
+    } else if (priceMoveRequiresRequote || bidMissing || bidSizeChanged) {
+      await this.replaceLeg("bid", bidPrice, bidQty);
     }
 
     if (inventoryTooShort) {
-      if (this.ask) await this.replaceLeg("ask", askPrice, qty, false);
+      if (this.ask) await this.replaceLeg("ask", askPrice, askQty, false);
       else this.log(`INVENTORY GUARD: ${invUsdso.toFixed(2)} USDso < ${lowerInventoryUsdso.toFixed(2)} — ask paused`);
-    } else if (priceMoveRequiresRequote || askMissing) {
-      await this.replaceLeg("ask", askPrice, qty);
+    } else if (priceMoveRequiresRequote || askMissing || askSizeChanged) {
+      await this.replaceLeg("ask", askPrice, askQty);
     }
   }
 

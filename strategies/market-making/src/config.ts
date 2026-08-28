@@ -41,6 +41,15 @@ export const config = {
     "MM_INVENTORY_GUARD_BAND_USDSO",
     num("MM_NOTIONAL_USDSO", 20),
   ),
+  /** Enable pre-emptive side sizing near the hard inventory guard edges. */
+  softInventoryGuardEnabled: bool("MM_SOFT_INVENTORY_GUARD_ENABLED", false),
+  /** Distance inward from each hard guard edge where the worsening side is reduced. */
+  softInventoryGuardWidthUsdso: num("MM_SOFT_INVENTORY_GUARD_WIDTH_USDSO", 30),
+  /** Notional used on the side that would worsen inventory inside the soft guard zone. */
+  softInventoryGuardNotionalUsdso: num(
+    "MM_SOFT_INVENTORY_GUARD_NOTIONAL_USDSO",
+    num("MM_NOTIONAL_USDSO", 20) / 2,
+  ),
   /** How hard to skew per unit of inventory imbalance, in bps per 1× notional. */
   inventorySkewBps: num("MM_INVENTORY_SKEW_BPS", 4),
   /** Enable a confirmed trend filter that tilts inventory target without changing quote notional. */
