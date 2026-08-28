@@ -16,6 +16,8 @@ interface RestingOrder {
   postedAtMs: number;
 }
 
+type TrendState = "NEUTRAL" | "UPTREND" | "DOWNTREND";
+
 export class MarketMaker {
   private bid?: RestingOrder;
   private ask?: RestingOrder;
@@ -23,6 +25,14 @@ export class MarketMaker {
   private lastRequoteAt = 0;
   private requoting = false;
   private gasPaused = false;
+
+  private trendState: TrendState = "NEUTRAL";
+  private trendCandidate: TrendState = "NEUTRAL";
+  private trendCandidateCount = 0;
+  private fastEma?: number;
+  private slowEma?: number;
+  private lastTrendUpdateMs?: number;
+  private trendHistory: Array<{ ts: number; mid: number }> = [];
 
   constructor(
     private readonly pool: Pool,
@@ -102,6 +112,62 @@ export class MarketMaker {
     }
   }
 
+  private updateTrend(mid: number, now: number): number {
+    if (!this.cfg.trendFilterEnabled) return this.cfg.targetInventoryUsdso;
+
+    if (this.fastEma === undefined || this.slowEma === undefined || this.lastTrendUpdateMs === undefined) {
+      this.fastEma = mid;
+      this.slowEma = mid;
+      this.lastTrendUpdateMs = now;
+      this.trendHistory = [{ ts: now, mid }];
+      return this.cfg.targetInventoryUsdso;
+    }
+
+    const dt = Math.max(1, now - this.lastTrendUpdateMs);
+    this.lastTrendUpdateMs = now;
+    const fastAlpha = 1 - Math.exp(-dt / Math.max(1, this.cfg.trendFastEmaMs));
+    const slowAlpha = 1 - Math.exp(-dt / Math.max(1, this.cfg.trendSlowEmaMs));
+    this.fastEma += fastAlpha * (mid - this.fastEma);
+    this.slowEma += slowAlpha * (mid - this.slowEma);
+
+    this.trendHistory.push({ ts: now, mid });
+    const cutoff = now - this.cfg.trendMoveWindowMs;
+    while (this.trendHistory.length > 2 && this.trendHistory[1].ts < cutoff) {
+      this.trendHistory.shift();
+    }
+
+    const anchor = this.trendHistory.find((p) => p.ts >= cutoff) ?? this.trendHistory[0];
+    const emaBps = ((this.fastEma - this.slowEma) / this.slowEma) * 10_000;
+    const moveBps = anchor ? ((mid - anchor.mid) / anchor.mid) * 10_000 : 0;
+
+    let candidate: TrendState = "NEUTRAL";
+    if (emaBps >= this.cfg.trendEmaThresholdBps && moveBps >= this.cfg.trendMoveThresholdBps) {
+      candidate = "UPTREND";
+    } else if (emaBps <= -this.cfg.trendEmaThresholdBps && moveBps <= -this.cfg.trendMoveThresholdBps) {
+      candidate = "DOWNTREND";
+    }
+
+    if (candidate === this.trendCandidate) {
+      this.trendCandidateCount += 1;
+    } else {
+      this.trendCandidate = candidate;
+      this.trendCandidateCount = 1;
+    }
+
+    if (this.trendCandidateCount >= Math.max(1, Math.floor(this.cfg.trendConfirmations)) && candidate !== this.trendState) {
+      this.trendState = candidate;
+      this.log(`TREND ${this.trendState}: ema=${emaBps.toFixed(2)}bps move=${moveBps.toFixed(2)}bps`);
+    }
+
+    const tilt = this.trendState === "UPTREND"
+      ? this.cfg.trendTargetTiltUsdso
+      : this.trendState === "DOWNTREND"
+        ? -this.cfg.trendTargetTiltUsdso
+        : 0;
+
+    return Math.max(0, this.cfg.targetInventoryUsdso + tilt);
+  }
+
   private async requote(): Promise<void> {
     if (!this.cfg.dryRun) {
       const gasSomi = await this.pool.signerGasBalance();
@@ -142,6 +208,8 @@ export class MarketMaker {
     this.lastMid = mid;
     this.lastRequoteAt = Date.now();
 
+    const effectiveTargetInventoryUsdso = this.updateTrend(mid, this.lastRequoteAt);
+
     // walletBase() only sees free WBTC. A resting ask locks WBTC in the pool,
     // so include that tracked quantity when computing total inventory. Without
     // this, the strategy can think inventory is low and keep buying while a sell
@@ -150,14 +218,14 @@ export class MarketMaker {
     const lockedAskBase = this.ask?.qty ?? 0;
     const totalBase = freeBase + lockedAskBase;
     const invUsdso = totalBase * mid;
-    const imbalance = (invUsdso - this.cfg.targetInventoryUsdso) / this.cfg.notionalUsdso;
+    const imbalance = (invUsdso - effectiveTargetInventoryUsdso) / this.cfg.notionalUsdso;
     const skewBps = imbalance * this.cfg.inventorySkewBps;
 
-    // Configurable inventory band around the target. Outside this band we stop
+    // Configurable inventory band around the effective target. Outside this band we stop
     // adding inventory in the wrong direction and quote only the side that
-    // brings the wallet back toward target. The default remains one notional.
-    const lowerInventoryUsdso = Math.max(0, this.cfg.targetInventoryUsdso - this.cfg.inventoryGuardBandUsdso);
-    const upperInventoryUsdso = this.cfg.targetInventoryUsdso + this.cfg.inventoryGuardBandUsdso;
+    // brings the wallet back toward target.
+    const lowerInventoryUsdso = Math.max(0, effectiveTargetInventoryUsdso - this.cfg.inventoryGuardBandUsdso);
+    const upperInventoryUsdso = effectiveTargetInventoryUsdso + this.cfg.inventoryGuardBandUsdso;
     const inventoryTooLong = invUsdso > upperInventoryUsdso;
     const inventoryTooShort = invUsdso < lowerInventoryUsdso;
 
@@ -183,7 +251,7 @@ export class MarketMaker {
       return;
     }
 
-    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)} invUsdso=${invUsdso.toFixed(2)}`);
+    this.log(`requote mid=${mid.toFixed(6)} bid=${bidPrice.toFixed(6)} ask=${askPrice.toFixed(6)} qty=${qty.toFixed(6)} skewBps=${skewBps.toFixed(2)} invUsdso=${invUsdso.toFixed(2)} trend=${this.trendState} target=${effectiveTargetInventoryUsdso.toFixed(2)}`);
 
     if (inventoryTooLong) {
       if (this.bid) await this.replaceLeg("bid", bidPrice, qty, false);
