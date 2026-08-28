@@ -43,6 +43,22 @@ export const config = {
   ),
   /** How hard to skew per unit of inventory imbalance, in bps per 1× notional. */
   inventorySkewBps: num("MM_INVENTORY_SKEW_BPS", 4),
+  /** Enable a confirmed trend filter that tilts inventory target without changing quote notional. */
+  trendFilterEnabled: bool("MM_TREND_FILTER_ENABLED", false),
+  /** Fast EMA time constant used by the trend filter. */
+  trendFastEmaMs: num("MM_TREND_FAST_EMA_MS", 5 * 60_000),
+  /** Slow EMA time constant used by the trend filter. */
+  trendSlowEmaMs: num("MM_TREND_SLOW_EMA_MS", 20 * 60_000),
+  /** Minimum fast-vs-slow EMA separation required to call a trend, in bps. */
+  trendEmaThresholdBps: num("MM_TREND_EMA_THRESHOLD_BPS", 6),
+  /** Recent price-move window used as a second confirmation signal. */
+  trendMoveWindowMs: num("MM_TREND_MOVE_WINDOW_MS", 15 * 60_000),
+  /** Minimum absolute recent move required to confirm the EMA signal, in bps. */
+  trendMoveThresholdBps: num("MM_TREND_MOVE_THRESHOLD_BPS", 12),
+  /** Consecutive confirmed observations required before switching trend state. */
+  trendConfirmations: num("MM_TREND_CONFIRMATIONS", 3),
+  /** USDso amount added/subtracted from the normal inventory target in up/down trends. */
+  trendTargetTiltUsdso: num("MM_TREND_TARGET_TILT_USDSO", 8),
   /** Only requote once mid has moved this many bps. */
   requoteTriggerBps: num("MM_REQUOTE_TRIGGER_BPS", 3),
   /** Don't quote if the book's own spread is wider than this. */
